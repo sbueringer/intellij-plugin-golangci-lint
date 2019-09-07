@@ -23,7 +23,7 @@ dependencies {
 intellij {
     version 'LATEST-EAP-SNAPSHOT'
     type 'IU'
-    plugins 'org.jetbrains.plugins.go:192.4488.21.2525'
+    plugins 'org.jetbrains.plugins.go:192.6603.23.335'
     intellij.updateSinceUntilBuild false
 }
 compileKotlin {

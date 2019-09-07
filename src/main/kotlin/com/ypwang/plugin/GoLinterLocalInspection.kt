@@ -3,25 +3,36 @@ package com.ypwang.plugin
 import com.goide.project.GoProjectLibrariesService
 import com.goide.psi.GoFile
 import com.google.gson.Gson
-import com.intellij.codeInspection.*
+import com.intellij.codeInspection.InspectionManager
+import com.intellij.codeInspection.LocalInspectionTool
+import com.intellij.codeInspection.ProblemDescriptor
+import com.intellij.codeInspection.ProblemHighlightType
 import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationListener
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.editor.LogicalPosition
+import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.TextEditor
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.util.TextRange
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.wm.IdeFocusManager
 import com.intellij.psi.PsiFile
 import com.ypwang.plugin.form.GoLinterSettings
-import com.ypwang.plugin.model.*
+import com.ypwang.plugin.model.LintIssue
+import com.ypwang.plugin.model.LintReport
 import com.ypwang.plugin.util.GoLinterNotificationGroup
-
 import com.ypwang.plugin.util.Log
 import com.ypwang.plugin.util.ProcessWrapper
 import java.io.File
 import java.nio.file.Paths
-import java.util.concurrent.locks.*
+import java.util.concurrent.locks.Lock
+import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import javax.swing.event.HyperlinkEvent
 import kotlin.concurrent.read
 import kotlin.concurrent.write
 
@@ -67,7 +78,7 @@ class GoLinterLocalInspection : LocalInspectionTool() {
             System.getenv("GOPATH")?.let { goPaths.addAll(it.split(':').map { path -> Paths.get(path, "src") }) }
         }
 
-        val theGoPath = goPaths.singleOrNull{ absolutePath.startsWith(it) }
+        val theGoPath = goPaths.singleOrNull { absolutePath.startsWith(it) }
 
         var matchingName = absolutePath.fileName.toString()
         var checkName = absolutePath.fileName.toString()
@@ -80,9 +91,22 @@ class GoLinterLocalInspection : LocalInspectionTool() {
 
             if (subtract.nameCount > 1) {
                 // absolute.parent == srcPath
-                workingDir = theGoPath.toString()
-                checkName = "${subtract.getName(0)}${File.separator}..."       // it's a folder
-                matchingName = subtract.toString()
+                var current = absolutePath
+                while (current.toFile().exists()) {
+                    if (Paths.get(current.toString() + "/go.mod").toFile().exists()) {
+                        break
+                    }
+                    current = current.parent
+                }
+                if (current.nameCount > 0) {
+                    workingDir = current.toString()
+                    checkName = "${current.relativize(absolutePath).parent}${File.separator}..."
+                    matchingName = current.relativize(absolutePath).toString()
+                } else {
+                    workingDir = theGoPath.toString()
+                    checkName = "${subtract.getName(0)}${File.separator}..."       // it's a folder
+                    matchingName = subtract.toString()
+                }
             }
         }
 
@@ -91,16 +115,18 @@ class GoLinterLocalInspection : LocalInspectionTool() {
         // intellij will instant as many inspection clazz as opened tab
         // for those tab share same folder, we could just run once lint
         // for those tab don't share folder, we should allow them to run in parallel
+        val lockFolder = absolutePath.parent.toString()
         mapMutex.read {
-            if (workingDir !in lintResult) {
+            if (lockFolder !in lintResult) {
                 mapMutex.write {
-                    lintResult[workingDir] = InspectionResult()
+                    lintResult[lockFolder] = InspectionResult()
                 }
             }
 
-            val rstRefer = lintResult[workingDir]!!
+            val rstRefer = lintResult[lockFolder]!!
             // newly opened file without modified could benefit from previous run
             if (rstRefer.timeStamp < absolutePath.toFile().lastModified()) {
+                Log.goLinter.info("File changed: last run time ${rstRefer.timeStamp}, file change stamp ${absolutePath.toFile().lastModified()}")
                 // run inspection now
                 try {
                     if (rstRefer.mutex.tryLock()) {
@@ -124,19 +150,25 @@ class GoLinterLocalInspection : LocalInspectionTool() {
                         }
                         parameters.add(checkName)
 
+                        rstRefer.timeStamp = System.currentTimeMillis()
                         val scanResultRaw = ProcessWrapper.runWithArguments(parameters, workingDir)
+                        Log.goLinter.info("Finished linting return code: ${scanResultRaw.returnCode}")
+                        Log.goLinter.info("Run stderr: ${scanResultRaw.stderr}")
+                        Log.goLinter.info("Run stdout: ${scanResultRaw.stdout}")
                         if (scanResultRaw.returnCode == 1) {     // default exit code is 1
-                            rstRefer.timeStamp = System.currentTimeMillis()
                             rstRefer.issues = Gson().fromJson(scanResultRaw.stdout, LintReport::class.java).Issues
-                        }
-                        else {
+                        } else if (scanResultRaw.returnCode == 0) {     // default exit code is 0 if no issues are found
+                            rstRefer.issues = ArrayList()
+                            GoLinterNotificationGroup.instance
+                                    .createNotification("golangci-lint successful", "Found no issues", NotificationType.INFORMATION, null as NotificationListener?)
+                                    .notify(manager.project)
+                        } else {
                             // linter run error, clean cache
-                            Log.goLinter.error("Run error: ${scanResultRaw.stderr}")
                             rstRefer.timeStamp = Long.MIN_VALUE
-                            rstRefer.issues = null
+                            rstRefer.issues = ArrayList()
 
                             val notification = GoLinterNotificationGroup.instance
-                                .createNotification("Go linter parameters error", "golangci-lint parameters is wrongly configured", NotificationType.ERROR, null as NotificationListener?)
+                                    .createNotification("golangci-lint error", "golangci-lint has thrown an err. stderr: ${scanResultRaw.stderr} stdout: ${scanResultRaw.stdout}", NotificationType.ERROR, null as NotificationListener?)
 
                             notification.addAction(NotificationAction.createSimple("Configure") {
                                 ShowSettingsUtil.getInstance().editConfigurable(manager.project, GoLinterSettings(manager.project))
@@ -153,6 +185,42 @@ class GoLinterLocalInspection : LocalInspectionTool() {
                 } finally {
                     rstRefer.mutex.unlock()
                 }
+            } else {
+                Log.goLinter.info("File not changed: last run time ${rstRefer.timeStamp}, file change stamp ${absolutePath.toFile().lastModified()}")
+            }
+
+            // TODO test this
+            when {
+                rstRefer.issues != null -> {
+                    Log.goLinter.info("Reporting issues: ${rstRefer.issues}")
+                    var message = ""
+                    rstRefer.issues?.forEach { issue -> message += "<a href=\"$workingDir${File.separator}${issue.Pos.Filename}:${issue.Pos.Line}:${issue.Pos.Column}\">${issue.Pos.Filename}:${issue.Pos.Line}</a>: ${issue.Text} (${issue.FromLinter})\n" }
+
+                    val notification = GoLinterNotificationGroup.instance
+                            .createNotification("golangci-lint found issues", message, NotificationType.WARNING) { _, event ->
+                                if (event.eventType == HyperlinkEvent.EventType.ACTIVATED) {
+                                    val splitLink = event.description.split(":")
+
+
+                                    val virtualFile = LocalFileSystem.getInstance().findFileByIoFile(File(splitLink[0]))
+                                    val editors = FileEditorManager.getInstance(manager.project).openFile(virtualFile!!, true)
+                                    if (splitLink.size == 3 && editors.isNotEmpty()) {
+                                        val textEditor = editors[0]
+                                        if (textEditor is TextEditor) {
+                                            val position = LogicalPosition(splitLink[1].toInt()-1, splitLink[2].toInt())
+                                            textEditor.editor.caretModel.removeSecondaryCarets()
+                                            textEditor.editor.caretModel.moveToLogicalPosition(position)
+                                            textEditor.editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
+                                            textEditor.editor.selectionModel.removeSelection()
+                                            IdeFocusManager.getGlobalInstance().requestFocus(textEditor.editor.contentComponent, true)
+                                        }
+                                    }
+                                }
+                            }
+
+                    notification.notify(manager.project)
+                }
+                else -> Log.goLinter.info("Reporting no issues")
             }
 
             val document = FileDocumentManager.getInstance().getDocument(file.virtualFile)!!
@@ -163,19 +231,19 @@ class GoLinterLocalInspection : LocalInspectionTool() {
                         val lineStart = document.getLineStartOffset(lineNumber)
                         val lineEnd = document.getLineEndOffset(lineNumber)
 
-                        Triple(lineStart + issue.Pos.Column - 1, lineEnd, "${issue.Text} (${issue.FromLinter})")
-                    }.filter {
-                        // this may happen on hot edit, PsiFile is not updated as soon as the file saved
-                        it.first <= it.second
-                    }.map { (start, end, text) ->
-                        manager.createProblemDescriptor(
-                            file,
-                            TextRange.create(start, end),
-                            text,
-                            ProblemHighlightType.GENERIC_ERROR_OR_WARNING,
-                            isOnTheFly
-                        )
-                    }.toList().toTypedArray()
+                            Triple(lineStart + issue.Pos.Column - 1, lineEnd, "${issue.Text} (${issue.FromLinter})")
+                        }.filter {
+                            // this may happen on hot edit, PsiFile is not updated as soon as the file saved
+                            it.first <= it.second
+                        }.map { (start, end, text) ->
+                            manager.createProblemDescriptor(
+                                    file,
+                                    TextRange.create(start, end),
+                                    text,
+                                    ProblemHighlightType.GENERIC_ERROR_OR_WARNING,
+                                    isOnTheFly
+                            )
+                        }.toList().toTypedArray()
             }
         }
     }

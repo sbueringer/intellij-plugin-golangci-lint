@@ -3,5 +3,8 @@
 .gradle
 build/
 project/
-
+gradle
+gradlew
+gradlew.bat
 gradle.properties
+out
